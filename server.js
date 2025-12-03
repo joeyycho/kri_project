@@ -153,6 +153,18 @@ async function kriSearch({ name, org }) {
     body: "requestOrder"
   });
 
+    // 4.5) 모바일 도메인 쿠키/세션 확보 (중요: www 세션이 m으로 안 넘어가는 케이스 대응)
+  await cookieFetch("https://m.kri.go.kr/kri/mobile/KRI_RP_MO_001.jsp", {
+    method: "GET",
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Referer": "https://m.kri.go.kr/"
+    }
+  });
+
+
   // 5) 모바일 검색 POST
   const form2 = new URLSearchParams();
   form2.set("mode", "firstSearch");
@@ -167,7 +179,8 @@ async function kriSearch({ name, org }) {
       "Content-Type": "application/x-www-form-urlencoded",
       "Origin": "https://m.kri.go.kr",
       "Referer": "https://m.kri.go.kr/kri/mobile/KRI_RP_MO_001.jsp",
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
     },
     body: form2.toString()
   });
