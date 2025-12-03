@@ -1,361 +1,223 @@
-// server.js
 import express from "express";
+import { CookieJar } from "tough-cookie";
+import { fetch } from "undici";
+import crypto from "crypto";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// ====== ENV ======
-const PORT = process.env.PORT || 3000;
-const API_TOKEN = process.env.API_TOKEN; // n8n에서 X-API-Token으로 보낼 토큰
+// ---- Config (Render 환경변수로 주입) ----
+const API_TOKEN = process.env.API_TOKEN; // 릴레이 호출 인증 토큰
+const KRI_UID = process.env.KRI_UID;     // 예: koolee33
+const KRI_UPW = process.env.KRI_UPW;     // 예: c2W97CH5~Z6m&L
 
-const KRI_UID = process.env.KRI_UID; // KRI 아이디 (plain)
-const KRI_UPW = process.env.KRI_UPW; // KRI 비번 (plain)
+// 기존 n8n에 있던 base64 값(있으면 그대로 환경변수로 넣고 사용)
+const KRI_ID_B64 = process.env.KRI_ID_B64; // 예: a29vbGVlMzM=
+const KRI_PW_B64 = process.env.KRI_PW_B64; // 예: YzJXOTdDSDV+WjZtJkw=
 
-const KRI_ID_B64 = process.env.KRI_ID_B64; // optional
-const KRI_PW_B64 = process.env.KRI_PW_B64; // optional
+if (!API_TOKEN || !KRI_UID || !KRI_UPW) {
+  console.warn("Missing env vars. Need API_TOKEN, KRI_UID, KRI_UPW (and ideally KRI_ID_B64/KRI_PW_B64).");
+}
 
-if (!API_TOKEN) console.warn("Missing API_TOKEN env");
-if (!KRI_UID || !KRI_UPW) console.warn("Missing KRI_UID or KRI_UPW env");
-
-// ====== Simple Auth ======
+// 간단 인증 미들웨어
 function auth(req, res, next) {
-  const token = req.header("X-API-Token");
-  if (!token || token !== API_TOKEN) {
+  const got = req.headers["x-api-token"];
+  if (!API_TOKEN || got !== API_TOKEN) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
   next();
 }
 
-// ====== In-memory cookie jar ======
-let jar = {
-  wmonid: null,
-  jsessionid: null,
-  lastLoginAt: 0,
-};
+// 쿠키jar + fetch wrapper
+function makeClient() {
+  const jar = new CookieJar();
 
-const LOGIN_TTL_MS = 1000 * 60 * 10; // 10분 (적당히 늘리거나 줄이세요)
+  async function cookieFetch(url, options = {}) {
+    const u = new URL(url);
+    const cookieHeader = await jar.getCookieString(u.origin + u.pathname);
 
-// ====== helpers ======
-const now = () => Date.now();
+    const headers = new Headers(options.headers || {});
+    if (cookieHeader) headers.set("cookie", cookieHeader);
 
-function safeStr(v) {
-  return String(v ?? "").trim();
-}
+    const resp = await fetch(url, {
+      ...options,
+      headers,
+      redirect: "manual" // 쿠키 직접 따라가므로 manual 유지
+    });
 
-function cookieHeader() {
-  const parts = [];
-  if (jar.wmonid) parts.push(`WMONID=${jar.wmonid}`);
-  if (jar.jsessionid) parts.push(`JSESSIONID=${jar.jsessionid}`);
-  return parts.join("; ");
+    // Set-Cookie 저장
+    const setCookies = resp.headers.getSetCookie?.() || [];
+    for (const sc of setCookies) {
+      await jar.setCookie(sc, url);
+    }
+
+    // 30x 리다이렉트 따라가기(필요시)
+    if ([301, 302, 303, 307, 308].includes(resp.status)) {
+      const loc = resp.headers.get("location");
+      if (loc) {
+        const nextUrl = new URL(loc, url).toString();
+        // 303이면 GET으로 변경하는게 일반적
+        const nextOpts =
+          resp.status === 303
+            ? { method: "GET", headers: options.headers }
+            : { ...options };
+        return cookieFetch(nextUrl, nextOpts);
+      }
+    }
+
+    return resp;
+  }
+
+  return { jar, cookieFetch };
 }
 
 /**
- * Node/undici/express 환경별로 set-cookie 가져오는 방법이 달라서 최대한 방어적으로 처리
+ * KRI 로그인 + 모바일 검색까지 1회 세션으로 수행
  */
-function getSetCookieArray(res) {
-  // 1) Node 20+ 일부 환경: getSetCookie()
-  if (res?.headers?.getSetCookie) {
-    try {
-      const v = res.headers.getSetCookie();
-      if (Array.isArray(v)) return v;
-    } catch {}
-  }
-
-  // 2) undici Headers: set-cookie 단일 문자열(합쳐진 경우가 있어 split 위험)
-  //    일단 하나로라도 받으면 배열로 감싼다.
-  const sc = res?.headers?.get?.("set-cookie");
-  if (sc) return Array.isArray(sc) ? sc : [sc];
-
-  // 3) node-fetch 스타일 raw()
-  if (res?.headers?.raw) {
-    try {
-      const raw = res.headers.raw();
-      if (raw?.["set-cookie"]) return raw["set-cookie"];
-    } catch {}
-  }
-
-  return [];
-}
-
-function parseSetCookie(setCookieArr = []) {
-  // set-cookie: ["WMONID=...; Path=/; ...", "JSESSIONID=...; Path=/; ...", ...]
-  const out = {};
-  for (const c of setCookieArr) {
-    const first = String(c).split(";")[0];
-    const idx = first.indexOf("=");
-    if (idx === -1) continue;
-    const k = first.slice(0, idx).trim();
-    const v = first.slice(idx + 1).trim();
-    if (k && v) out[k] = v;
-  }
-  return out;
-}
-
-async function fetchFull(url, options = {}) {
-  const res = await fetch(url, options);
-  const text = await res.text();
-  return { res, text };
-}
-
-// ====== KRI login flow ======
-async function ensureLogin() {
-  if (jar.jsessionid && now() - jar.lastLoginAt < LOGIN_TTL_MS) return;
+async function kriSearch({ name, org }) {
+  const { cookieFetch } = makeClient();
 
   // 1) Get Cookie
-  {
-    const { res } = await fetchFull("https://www.kri.go.kr/kri2", {
-      method: "GET",
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      },
-      redirect: "manual",
-    });
+  await cookieFetch("https://www.kri.go.kr/kri2", {
+    method: "GET",
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
+  });
 
-    const setCookie = getSetCookieArray(res);
-    const parsed = parseSetCookie(setCookie);
+  // 2) GetCertSign.jsp (POST)
+  // n8n 원본 바디 기반(필요한 것만)
+  const form1 = new URLSearchParams();
+  // base64 값이 있으면 그대로 쓰고, 없으면 uid/upw를 base64로 만들어서 사용(원본과 다를 수 있어 권장X)
+  const idB64 = KRI_ID_B64 || Buffer.from(KRI_UID).toString("base64");
+  const pwB64 = KRI_PW_B64 || Buffer.from(KRI_UPW).toString("base64");
 
-    if (parsed.WMONID) jar.wmonid = parsed.WMONID;
-    if (parsed.JSESSIONID) jar.jsessionid = parsed.JSESSIONID;
-  }
+  form1.set("id", idB64);
+  form1.set("pw", pwB64);
+  form1.set("loginCheck", "N");
+  form1.set("sysid", "KRI");
+  form1.set("skinColor", "sky_blue");
+  form1.set("type", "10");
+  form1.set("url", "https://www.kri.go.kr:443");
+  form1.set("uid", KRI_UID);
+  form1.set("upw", KRI_UPW);
+  form1.set("mbr_dvs_Cd", "null");
 
-  if (!jar.jsessionid) throw new Error("Failed to obtain JSESSIONID from KRI");
-
-  // 2) CrossCert step
-  const idB64 = KRI_ID_B64 || Buffer.from(KRI_UID, "utf8").toString("base64");
-  const pwB64 = KRI_PW_B64 || Buffer.from(KRI_UPW, "utf8").toString("base64");
-
-  await fetchFull("https://www.kri.go.kr/kri/rp/crosscert/GetCertSign.jsp?txtAnotherLogin=N", {
+  await cookieFetch("https://www.kri.go.kr/kri/rp/crosscert/GetCertSign.jsp?txtAnotherLogin=N", {
     method: "POST",
     headers: {
       "User-Agent": "Mozilla/5.0",
       "Content-Type": "application/x-www-form-urlencoded",
-      "Cookie": cookieHeader(),
       "Origin": "https://www.kri.go.kr",
-      "Referer": "https://www.kri.go.kr/kri2",
+      "Referer": "https://www.kri.go.kr/kri2"
     },
-    body: new URLSearchParams({
-      id: idB64,
-      pw: pwB64,
-      loginCheck: "N",
-      sysid: "KRI",
-      skinColor: "sky_blue",
-      type: "10",
-      url: "https://www.kri.go.kr:443",
-      uid: KRI_UID,
-      upw: KRI_UPW,
-      mbr_dvs_Cd: "null",
-    }).toString(),
+    body: form1.toString()
   });
 
-  // 3) login_exec
-  await fetchFull(
-    `https://www.kri.go.kr/kri/rp/login_exec.jsp?txtLoginId=${encodeURIComponent(idB64)}&txtLogDvs=1&txtUserPw=${encodeURIComponent(pwB64)}&txtLoginDvs=I&txtAnotherLogin=N&txtAgree=1`,
-    {
-      method: "GET",
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-        "Cookie": cookieHeader(),
-        "Referer": "https://www.kri.go.kr/kri/rp/crosscert/GetCertSign.jsp?txtAnotherLogin=N",
-      },
-    }
-  );
+  // 3) login_exec.jsp (GET with query)
+  const q = new URLSearchParams();
+  q.set("txtLoginId", idB64);
+  q.set("txtLogDvs", "1");
+  q.set("txtUserPw", pwB64);
+  q.set("txtLoginDvs", "I");
+  q.set("txtAnotherLogin", "N");
+  q.set("txtAgree", "1");
 
-  // 4) 검색 페이지 진입 + requestOrder (세션 안정화)
-  await fetchFull("https://www.kri.go.kr/kri/rp/rschachv/PG-RP-101-01jl.jsp?new=new2", {
+  await cookieFetch(`https://www.kri.go.kr/kri/rp/login_exec.jsp?${q.toString()}`, {
     method: "GET",
     headers: {
       "User-Agent": "Mozilla/5.0",
-      "Cookie": `potalHelpViewYn=Y; ${cookieHeader()}`,
-      "Referer": "https://www.kri.go.kr/kri2",
-    },
+      "Referer": "https://www.kri.go.kr/kri/rp/crosscert/GetCertSign.jsp?txtAnotherLogin=N"
+    }
   });
 
-  await fetchFull("https://www.kri.go.kr/kri/rp/rschachv/PG-RP-101-01js.jsp", {
+  // 4) (선택) 페이지 워밍업 (너 원본 플로우와 유사)
+  await cookieFetch("https://www.kri.go.kr/kri/rp/rschachv/PG-RP-101-01jl.jsp?new=new2", {
+    method: "GET",
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      "Referer": "https://www.kri.go.kr/kri2"
+    }
+  });
+
+  await cookieFetch("https://www.kri.go.kr/kri/rp/rschachv/PG-RP-101-01js.jsp", {
     method: "POST",
     headers: {
       "User-Agent": "Mozilla/5.0",
       "X-Requested-With": "XMLHttpRequest",
       "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-      "Cookie": `potalHelpViewYn=Y; ${cookieHeader()}`,
-      "Referer": "https://www.kri.go.kr/kri/rp/rschachv/PG-RP-101-01jl.jsp?new=new2",
+      "Origin": "https://www.kri.go.kr",
+      "Referer": "https://www.kri.go.kr/kri/rp/rschachv/PG-RP-101-01jl.jsp?new=new2"
     },
-    body: "requestOrder",
+    body: "requestOrder"
   });
 
-  jar.lastLoginAt = now();
-}
+    // 4.5) 모바일 도메인 쿠키/세션 확보 (중요: www 세션이 m으로 안 넘어가는 케이스 대응)
+  await cookieFetch("https://m.kri.go.kr/kri/mobile/KRI_RP_MO_001.jsp", {
+    method: "GET",
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Referer": "https://m.kri.go.kr/"
+    }
+  });
 
-// ====== KRI XML 응답(TR) → JSON 배열 파서 ======
-// KRI는 <TR>마다 "‡" 구분자 문자열을 내려줍니다.
-// 첫 칼럼이 보통 row index 같은 값이라, 기존 Code23처럼 idx+1로 맞춥니다.
-function parseKriSheetToJson(xmlText, requestOrder) {
-  const cols = requestOrder.split("|").filter(Boolean);
 
-  // <TR>...</TR> 문자열 추출 (간단 파싱: XML parser 없이)
-  const trMatches = xmlText.match(/<TR>([\s\S]*?)<\/TR>/gi) || [];
+  // 5) 모바일 검색 POST
+  const form2 = new URLSearchParams();
+  form2.set("mode", "firstSearch");
+  form2.set("txtSchNm", name ?? "");
+  form2.set("txtAgcNmP", org ?? "");
+  // 나머지 파라미터는 비워도 되게 원본이 비움. 필요시 추가 가능.
 
-  const rows = [];
-
-  for (const tr of trMatches) {
-    // TR 내부 텍스트만 뽑기 (태그 제거)
-    const inner = tr
-      .replace(/^<TR>/i, "")
-      .replace(/<\/TR>$/i, "")
-      .replace(/<[^>]+>/g, "") // 혹시 태그가 섞이면 제거
-      .trim();
-
-    if (!inner) continue;
-
-    const parts = inner.split("‡");
-
-    // 기존 Code23로 미루어보면 parts[0]은 의미 없는 값(행 번호/구분)일 가능성이 높아 idx+1 사용
-    const obj = {};
-    cols.forEach((key, idx) => {
-      obj[key] = (parts[idx + 1] ?? "").trim();
-    });
-
-    // “빈 행” 방지: 전부 빈 문자열이면 skip
-    const hasAny = Object.values(obj).some((v) => v !== "");
-    if (hasAny) rows.push(obj);
-  }
-
-  return rows;
-}
-
-// 공통: 특정 엔드포인트 호출 → JSON 배열 반환
-async function kriFetchSheetAsJson({ kri_id, url, requestOrder }) {
-  await ensureLogin();
-
-  const body = new URLSearchParams({
-    requestOrder,
-    sheetAcation: "F",
-    txtRschrRegNo: kri_id,
-  }).toString();
-
-  const { res: r, text: xmlText } = await fetchFull(url, {
+  const resp = await cookieFetch("https://m.kri.go.kr/kri/mobile/PG-RP-101-01jl.jsp", {
     method: "POST",
     headers: {
       "User-Agent": "Mozilla/5.0",
       "Content-Type": "application/x-www-form-urlencoded",
-      "Cookie": `JSESSIONID=${jar.jsessionid}`,
+      "Origin": "https://m.kri.go.kr",
+      "Referer": "https://m.kri.go.kr/kri/mobile/KRI_RP_MO_001.jsp",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
     },
-    body,
+    body: form2.toString()
   });
 
-  const data = parseKriSheetToJson(xmlText, requestOrder);
-
-  return { kriStatus: r.status, data };
+  const html = await resp.text();
+  return { status: resp.status, html };
 }
 
-// ====== Routes ======
+// 헬스체크
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// (1) 이름/소속으로 KRI 모바일 검색 HTML 반환
+// 검색 API
 app.post("/search", auth, async (req, res) => {
   try {
-    const name = safeStr(req.body?.name);
-    const org = safeStr(req.body?.org);
+    const { name, org } = req.body || {};
+    if (!name || !org) {
+      return res.status(400).json({ ok: false, error: "name and org are required" });
+    }
 
-    await ensureLogin();
+    const t0 = Date.now();
+    const out = await kriSearch({ name, org });
+    const ms = Date.now() - t0;
 
-    const body = new URLSearchParams({
-      mode: "firstSearch",
-      txtSchNm: name,
-      txtAgcNmP: org,
-      agcCd: "",
-      comcdSelVal: "",
-      treeLev: "",
-      comCdSel_lv1: "",
-      comCdSel_lv2: "",
-      comCdSel_lv3: "",
-      comCdSel_lv4: "",
-    }).toString();
-
-    const { res: r, text: html } = await fetchFull("https://m.kri.go.kr/kri/mobile/PG-RP-101-01jl.jsp", {
-      method: "POST",
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Cookie": cookieHeader(),
-        "Origin": "https://m.kri.go.kr",
-        "Referer": "https://m.kri.go.kr/kri/mobile/KRI_RP_MO_001.jsp",
-      },
-      body,
+    // 너무 큰 HTML을 n8n으로 보내는 게 부담이면 일부만 또는 파싱해서 반환 추천.
+    res.json({
+      ok: true,
+      tookMs: ms,
+      kriStatus: out.status,
+      html: out.html
     });
-
-    res.json({ ok: true, kriStatus: r.status, html });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    res.status(500).json({
+      ok: false,
+      error: e?.message || "Unknown error"
+    });
   }
 });
 
-// (2) Projects
-app.post("/projects", auth, async (req, res) => {
-  try {
-    const kri_id = safeStr(req.body?.kri_id);
-    if (!kri_id) return res.status(400).json({ ok: false, error: "Missing kri_id" });
-
-    // ✅ 사용자가 준 프로젝트 requestOrder (그대로)
-    const requestOrder =
-      "|RSCHR_REG_NO|MNG_NO|RSCH_CMCM_YM|RSCH_END_YM|RSRCCT_SPPT_DVS_CD|RSCH_SBJT_STDY_SPHE_CD|RSCH_SBJT_NM|RSRCCT_SPPT_AGC_NM|TOT_RSRCCT|SBJT_NO|MNY_YR_SBJT_YN|BIZ_NM|CPT_GOV_OFFIC_NM|APD01_FLD_NM|APD02_FLD_NM|APD03_FLD_NM|APD04_FLD_NM|APD05_FLD_NM|MOD_DTTM|APPR_DVS_CD|APPR_RTRN_CNCL_RSN_CNTN|APPR_DTTM|DATA_SRC_DVS_CD|VRFC_DVS_CD|VRFC_DTTM|VRFC_PE_ID|VRFC_PE_NM|BLNG_UNIV_CD";
-
-    const { kriStatus, data } = await kriFetchSheetAsJson({
-      kri_id,
-      url: "https://www.kri.go.kr/kri/rp/rschachv/PG-RP-110-01js.jsp",
-      requestOrder,
-    });
-
-    res.json({ ok: true, kriStatus, data });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-// (3) Papers
-app.post("/papers", auth, async (req, res) => {
-  try {
-    const kri_id = safeStr(req.body?.kri_id);
-    if (!kri_id) return res.status(400).json({ ok: false, error: "Missing kri_id" });
-
-    const requestOrder =
-      "|RSCHR_REG_NO|MNG_NO|PBLC_YM|LANG_PPR_NM|ORG_LANG_PPR_NM|DIFF_LANG_PPR_NM|KRF_REG_PBLC_YN|OVRS_EXCLNC_SCJNL_PBLC_YN|PBLC_NTN_CD|SCJNL_NM|PBLC_PLC_NM|ISSN_NO|PPR_LANG_DVS_CD|IMPCT_FCTR|SCJNL_DVS_CD|RSRCHACPS_STDY_SPHE_CD|SBJT_NO|TOTAL_ATHR_CNT|PBLC_VOL_NO|PBLC_BK_NO|STT_PAGE|END_PAGE|VRFC_DVS_CD|VRFC_DTTM|APPR_DVS_CD|APPR_DTTM|APPR_RTRN_CNCL_RSN_CNTN|BLNG_UNIV_NM|BLNG_UNIV_CD|APD01_FLD_NM|APD02_FLD_NM|APD03_FLD_NM|APD04_FLD_NM|APD05_FLD_NM|RSRCHACPS_STDY_SPHE_NM|IRB_NO|MOD_DTTM|VRFC_PE_ID|APPR_PE_ID|VRFC_PE_NM|SBJT_NM|ABST_CNTN|LOGIC_FILE_NM|PHYSIC_FILE_NM| |VRFC_PPR_ID|VRFC_SRC_DVS_CD|DATA_SRC_DVS_CD|SCI_DVS_CD|OVERLAP_CHK|DOI";
-
-    const { kriStatus, data } = await kriFetchSheetAsJson({
-      kri_id,
-      url: "https://www.kri.go.kr/kri/rp/rschachv/PG-RP-108-01js.jsp",
-      requestOrder,
-    });
-
-    res.json({ ok: true, kriStatus, data });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-// (4) Patents / IP
-app.post("/patents", auth, async (req, res) => {
-  try {
-    const kri_id = safeStr(req.body?.kri_id);
-    if (!kri_id) return res.status(400).json({ ok: false, error: "Missing kri_id" });
-
-    const requestOrder =
-      "|RSCHR_REG_NO|MNG_NO|ITL_PPR_RGT_DVS_CD|ACQS_DVS_CD|ITL_PPR_RGT_NM|ACQS_NTN_DVS_CD|ACQS_DTL_DVS_CD|APPL_REG_NTN_CD|APPL_REG_NO|APPL_REG_DATE|INVT_NM|SMMR_CNTN|SBJT_NO|PCT_EPO_APPL_NTN_CNT|INVT_CNT|APPL_REGT_NM|BLNG_UNIV_CD|APPR_CNCL_DTTM|APPR_RTRN_CNCL_RSN_CNTN|VRFC_DVS_CD|AUTO_VRFC_DVS_CD|VRFC_DTTM|AUTO_VRFC_DTTM|APPR_DVS_CD|APPR_DTTM|BLNG_UNIV_NM|DEL_DVS_CD|APD01_FLD_NM|APD02_FLD_NM|APD03_FLD_NM|APD04_FLD_NM|APD05_FLD_NM|MOD_DTTM|VRFC_PE_ID|PAT_CLS_CD|VRFC_PE_NM|SBJT_NM|DATA_SRC_DVS_CD|ITL_PPR_RGT_REG_NO|ITL_PPR_RGT_REG_DATE|OVERLAP_CHK";
-
-    const { kriStatus, data } = await kriFetchSheetAsJson({
-      kri_id,
-      url: "https://www.kri.go.kr/kri/rp/rschachv/PG-RP-106-01js.jsp",
-      requestOrder,
-    });
-
-    res.json({ ok: true, kriStatus, data });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-// ===== start =====
-app.listen(PORT, () => {
-  console.log(`kri-relay listening on ${PORT}`);
-});
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`kri-relay listening on ${port}`));
