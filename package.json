@@ -9,8 +9,12 @@
   },
   "dependencies": {
     "cheerio": "^1.0.0-rc.12",
-    "express": "^4.19.2",
+    "express": "^4.22.1",
     "tough-cookie": "^4.1.4",
-    "undici": "^6.19.2"
-  }
+    "undici": "^6.22.0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": ""
 }
