@@ -267,6 +267,61 @@ async function kriAwards({ rschrRegNo }) {
   return { status: resp.status, body: await resp.text() };
 }
 
+// ✅ 단일 호출: 논문실적만
+async function kriPapers({ rschrRegNo }) {
+  const { cookieFetch } = makeClient();
+  await kriLoginAndWarmup(cookieFetch);
+
+  const form = new URLSearchParams();
+  form.set(
+    "requestOrder",
+    "|RSCHR_REG_NO|MNG_NO|PBLC_YM|LANG_PPR_NM|ORG_LANG_PPR_NM|DIFF_LANG_PPR_NM|KRF_REG_PBLC_YN|OVRS_EXCLNC_SCJNL_PBLC_YN|PBLC_NTN_CD|SCJNL_NM|PBLC_PLC_NM|ISSN_NO|PPR_LANG_DVS_CD|IMPCT_FCTR|SCJNL_DVS_CD|RSRCHACPS_STDY_SPHE_CD|SBJT_NO|TOTAL_ATHR_CNT|PBLC_VOL_NO|PBLC_BK_NO|STT_PAGE|END_PAGE|VRFC_DVS_CD|VRFC_DTTM|APPR_DVS_CD|APPR_DTTM|APPR_RTRN_CNCL_RSN_CNTN|BLNG_UNIV_NM|BLNG_UNIV_CD|APD01_FLD_NM|APD02_FLD_NM|APD03_FLD_NM|APD04_FLD_NM|APD05_FLD_NM|RSRCHACPS_STDY_SPHE_NM|IRB_NO|MOD_DTTM|VRFC_PE_ID|APPR_PE_ID|VRFC_PE_NM|SBJT_NM|ABST_CNTN|LOGIC_FILE_NM|PHYSIC_FILE_NM| |VRFC_PPR_ID|VRFC_SRC_DVS_CD|DATA_SRC_DVS_CD|SCI_DVS_CD|OVERLAP_CHK|DOI"
+  );
+  form.set("sheetAcation", "F");
+  form.set("txtRschrRegNo", String(rschrRegNo));
+
+  const resp = await cookieFetch("https://www.kri.go.kr/kri/rp/rschachv/PG-RP-108-01js.jsp", {
+    method: "POST",
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+      "Content-Type": "application/x-www-form-urlencoded",
+      Origin: "https://www.kri.go.kr"
+    },
+    body: form.toString()
+  });
+
+  return { status: resp.status, body: await resp.text() };
+}
+
+// ✅ 단일 호출: 연구비만
+async function kriFunding({ rschrRegNo }) {
+  const { cookieFetch } = makeClient();
+  await kriLoginAndWarmup(cookieFetch);
+
+  const form = new URLSearchParams();
+  form.set(
+    "requestOrder",
+    "|RSCHR_REG_NO|MNG_NO|RSCH_CMCM_YM|RSCH_END_YM|RSRCCT_SPPT_DVS_CD|RSCH_SBJT_STDY_SPHE_CD|RSCH_SBJT_NM|RSRCCT_SPPT_AGC_NM|TOT_RSRCCT|SBJT_NO|MNY_YR_SBJT_YN|BIZ_NM|CPT_GOV_OFFIC_NM|APD01_FLD_NM|APD02_FLD_NM|APD03_FLD_NM|APD04_FLD_NM|APD05_FLD_NM|MOD_DTTM|APPR_DVS_CD|APPR_RTRN_CNCL_RSN_CNTN|APPR_DTTM|DATA_SRC_DVS_CD|VRFC_DVS_CD|VRFC_DTTM|VRFC_PE_ID|VRFC_PE_NM|BLNG_UNIV_CD"
+  );
+  form.set("sheetAcation", "F");
+  form.set("txtRschrRegNo", String(rschrRegNo));
+
+  const resp = await cookieFetch("https://www.kri.go.kr/kri/rp/rschachv/PG-RP-110-01js.jsp", {
+    method: "POST",
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+      "Content-Type": "application/x-www-form-urlencoded",
+      Origin: "https://www.kri.go.kr"
+    },
+    body: form.toString()
+  });
+
+  return { status: resp.status, body: await resp.text() };
+}
+
+
 // 헬스체크
 app.get("/health", (req, res) => res.json({ ok: true }));
 
@@ -333,5 +388,35 @@ app.post("/awards", auth, async (req, res) => {
   }
 });
 
-const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`kri-relay listening on ${port}`));
+// ✅ 논문실적 단일 호출
+app.post("/papers", auth, async (req, res) => {
+  try {
+    const { rschrRegNo } = req.body || {};
+    if (!rschrRegNo) {
+      return res.status(400).json({ ok: false, error: "rschrRegNo is required" });
+    }
+    const t0 = Date.now();
+    const out = await kriPapers({ rschrRegNo });
+    res.json({ ok: true, tookMs: Date.now() - t0, ...out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || "Unknown error" });
+  }
+});
+
+// ✅ 연구비 단일 호출
+app.post("/funding", auth, async (req, res) => {
+  try {
+    const { rschrRegNo } = req.body || {};
+    if (!rschrRegNo) {
+      return res.status(400).json({ ok: false, error: "rschrRegNo is required" });
+    }
+    const t0 = Date.now();
+    const out = await kriFunding({ rschrRegNo });
+    res.json({ ok: true, tookMs: Date.now() - t0, ...out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || "Unknown error" });
+  }
+});
+
+const port = process.env.PORT || 3000;
