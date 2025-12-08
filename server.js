@@ -1,7 +1,12 @@
+// server.js (ESM)
+// - /search 를 모바일(m.kri.go.kr) 대신 www IBSheet 엔드포인트(PG-RP-101-01js.jsp)로 전환
+// - 모든 라우트 등록 후 app.listen()
+// - port 선언 순서 수정
+// - /search 응답: 원본 xml + (가능하면) rows JSON 파싱 결과 함께 반환
+
 import express from "express";
 import { CookieJar } from "tough-cookie";
 import { fetch } from "undici";
-import crypto from "crypto";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -19,6 +24,7 @@ if (!API_TOKEN || !KRI_UID || !KRI_UPW) {
   );
 }
 
+// -------------------- auth --------------------
 function auth(req, res, next) {
   const got = req.headers["x-api-token"];
   if (!API_TOKEN || got !== API_TOKEN) {
@@ -27,6 +33,7 @@ function auth(req, res, next) {
   next();
 }
 
+// -------------------- cookie fetch client --------------------
 function makeClient() {
   const jar = new CookieJar();
 
@@ -66,7 +73,9 @@ function makeClient() {
   return { jar, cookieFetch };
 }
 
+// -------------------- login & warmup (www only) --------------------
 async function kriLoginAndWarmup(cookieFetch) {
+  // 1) init cookie
   await cookieFetch("https://www.kri.go.kr/kri2", {
     method: "GET",
     headers: {
@@ -75,6 +84,7 @@ async function kriLoginAndWarmup(cookieFetch) {
     }
   });
 
+  // 2) crosscert
   const form1 = new URLSearchParams();
   const idB64 = KRI_ID_B64 || Buffer.from(KRI_UID).toString("base64");
   const pwB64 = KRI_PW_B64 || Buffer.from(KRI_UPW).toString("base64");
@@ -104,6 +114,7 @@ async function kriLoginAndWarmup(cookieFetch) {
     }
   );
 
+  // 3) login exec
   const q = new URLSearchParams();
   q.set("txtLoginId", idB64);
   q.set("txtLogDvs", "1");
@@ -121,6 +132,7 @@ async function kriLoginAndWarmup(cookieFetch) {
     }
   });
 
+  // 4) warm up list page + js (www)
   await cookieFetch("https://www.kri.go.kr/kri/rp/rschachv/PG-RP-101-01jl.jsp?new=new2", {
     method: "GET",
     headers: {
@@ -142,45 +154,107 @@ async function kriLoginAndWarmup(cookieFetch) {
     body: "requestOrder"
   });
 
-  await cookieFetch("https://m.kri.go.kr/kri/mobile/KRI_RP_MO_001.jsp", {
-    method: "GET",
-    headers: {
-      "User-Agent": "Mozilla/5.0",
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-      Referer: "https://m.kri.go.kr/"
-    }
-  });
-
   return { idB64, pwB64 };
 }
 
-async function kriSearch({ name, org }) {
+// -------------------- parsing helpers --------------------
+function parseRequestOrderCols(requestOrder) {
+  // requestOrder 예: "|A|B|C"
+  const raw = String(requestOrder || "");
+  const cols = raw
+    .split("|")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return cols;
+}
+
+function parseIbsheetTrRows(xmlText, cols) {
+  // 예시: <TR><![CDATA[‡11888822‡95‡...‡]]></TR>
+  // 구분자 '‡'로 split. 앞/뒤 빈 칸이 있을 수 있어 filter로 정리.
+  const xml = String(xmlText || "");
+  const matches = [...xml.matchAll(/<TR>\s*<!\[CDATA\[(.*?)\]\]>\s*<\/TR>/gs)];
+
+  const rows = [];
+  for (const m of matches) {
+    const cdata = m[1] ?? "";
+    // split 후 첫 토큰이 비거나, 마지막이 비는 케이스 있음
+    const parts = cdata.split("‡");
+    const values = parts.filter((v) => v !== ""); // 가장 단순한 정리(필요시 조정)
+
+    if (!cols?.length) {
+      rows.push({ values });
+      continue;
+    }
+
+    const obj = {};
+    // cols 길이와 values 길이가 1:1이 아닐 수 있어 가능한 만큼만 매핑
+    const n = Math.min(cols.length, values.length);
+    for (let i = 0; i < n; i++) obj[cols[i]] = values[i];
+    // 남는 값은 배열로 보관
+    if (values.length > n) obj.__extra = values.slice(n);
+    rows.push(obj);
+  }
+  return rows;
+}
+
+// -------------------- WWW search (replaces mobile search) --------------------
+async function kriSearchWww({ name, pageNo = 1, pageSize = 100, userId = KRI_UID, requestOrder }) {
   const { cookieFetch } = makeClient();
   await kriLoginAndWarmup(cookieFetch);
 
-  const form2 = new URLSearchParams();
-  form2.set("mode", "firstSearch");
-  form2.set("txtSchNm", name ?? "");
-  form2.set("txtAgcNmP", org ?? "");
+  const ro =
+    requestOrder ||
+    "|RSCHR_REG_NO|BIRTH_DT|AGC_ID|MNG_NO|KOR_NM|SEX_DVS_CD|AGC_NM|SBJT_NM|POSI_NM|DGR_SPCL_CD|DGR_ACQS_AGC_CD|ACQS_DGR_DVS_CD|SBJT_CD|POSI_CD|INFO_OPEN_YN";
 
-  const resp = await cookieFetch("https://m.kri.go.kr/kri/mobile/PG-RP-101-01jl.jsp", {
+  const form = new URLSearchParams();
+  form.set("requestOrder", ro);
+  form.set("sheetAcation", "R");
+  form.set("txtRschrRegNo", ""); // 검색 레지넘 지정 시 채움
+  form.set("txtUser", String(userId ?? ""));
+  form.set("txtMngNo", "");
+  form.set("txtEngYn", "N");
+  form.set("txtPUserDvs", "1");
+  form.set("txtKorNm", name ?? "");
+  form.set("txtKorHidden", "");
+  form.set("txtAgcId", "");
+  form.set("txtAgcNm", "");
+  form.set("txtPosiCd", "");
+  form.set("txtDgrSpclCd", "");
+  form.set("txtLev", "");
+  form.set("txtDgrSpclNm", "");
+  form.set("txtDgrAcqsAgcCd", "");
+  form.set("txtDgrAcqsAgcNm", "");
+  form.set("txtSearchRschrRegNo", "");
+  form.set("txtBirthDt", "");
+  form.set("txtBirthDt2", "");
+  form.set("ibTabTop0", "");
+  form.set("editpage0", "");
+  form.set("ibTabBottom0", "");
+  form.set("ibTabTop1", "");
+  form.set("editpage1", "");
+  form.set("ibTabBottom1", "");
+  form.set("iPageNo", String(pageNo));
+  form.set("iPageSize", String(pageSize));
+
+  const resp = await cookieFetch("https://www.kri.go.kr/kri/rp/rschachv/PG-RP-101-01js.jsp", {
     method: "POST",
     headers: {
       "User-Agent": "Mozilla/5.0",
-      "Content-Type": "application/x-www-form-urlencoded",
-      Origin: "https://m.kri.go.kr",
-      Referer: "https://m.kri.go.kr/kri/mobile/KRI_RP_MO_001.jsp",
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      Origin: "https://www.kri.go.kr",
+      Referer: "https://www.kri.go.kr/kri/rp/rschachv/PG-RP-101-01jl.jsp?new=new2"
     },
-    body: form2.toString()
+    body: form.toString()
   });
 
-  return { status: resp.status, html: await resp.text() };
+  const xml = await resp.text();
+  const cols = parseRequestOrderCols(ro);
+  const rows = parseIbsheetTrRows(xml, cols);
+
+  return { status: resp.status, xml, cols, rows };
 }
 
-// ✅ 단일 호출: 기본정보만
+// -------------------- existing single endpoints (www rschachv) --------------------
 async function kriBasic({ rschrRegNo, name }) {
   const { cookieFetch } = makeClient();
   await kriLoginAndWarmup(cookieFetch);
@@ -213,7 +287,6 @@ async function kriBasic({ rschrRegNo, name }) {
   return { status: resp.status, body: await resp.text() };
 }
 
-// ✅ 단일 호출: 경력사항만
 async function kriCareer({ rschrRegNo }) {
   const { cookieFetch } = makeClient();
   await kriLoginAndWarmup(cookieFetch);
@@ -240,7 +313,6 @@ async function kriCareer({ rschrRegNo }) {
   return { status: resp.status, body: await resp.text() };
 }
 
-// ✅ 단일 호출: 수상사항만
 async function kriAwards({ rschrRegNo }) {
   const { cookieFetch } = makeClient();
   await kriLoginAndWarmup(cookieFetch);
@@ -267,7 +339,6 @@ async function kriAwards({ rschrRegNo }) {
   return { status: resp.status, body: await resp.text() };
 }
 
-// ✅ 단일 호출: 논문실적만
 async function kriPapers({ rschrRegNo }) {
   const { cookieFetch } = makeClient();
   await kriLoginAndWarmup(cookieFetch);
@@ -294,7 +365,6 @@ async function kriPapers({ rschrRegNo }) {
   return { status: resp.status, body: await resp.text() };
 }
 
-// ✅ 단일 호출: 연구비만
 async function kriFunding({ rschrRegNo }) {
   const { cookieFetch } = makeClient();
   await kriLoginAndWarmup(cookieFetch);
@@ -321,29 +391,42 @@ async function kriFunding({ rschrRegNo }) {
   return { status: resp.status, body: await resp.text() };
 }
 
-
-// 헬스체크
+// -------------------- routes --------------------
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// 검색 API
+// ✅ 검색 API (www IBSheet 기반)
+// body: { name, pageNo?, pageSize?, requestOrder? }
+// - rows: requestOrder 컬럼명으로 매핑된 JSON
+// - xml: 원문 XML
 app.post("/search", auth, async (req, res) => {
   try {
-    const { name, org } = req.body || {};
-    if (!name || !org) {
-      return res.status(400).json({ ok: false, error: "name and org are required" });
+    const { name, pageNo, pageSize, requestOrder } = req.body || {};
+    if (!name) {
+      return res.status(400).json({ ok: false, error: "name is required" });
     }
 
     const t0 = Date.now();
-    const out = await kriSearch({ name, org });
+    const out = await kriSearchWww({
+      name,
+      pageNo: pageNo ?? 1,
+      pageSize: pageSize ?? 100,
+      requestOrder
+    });
     const ms = Date.now() - t0;
 
-    res.json({ ok: true, tookMs: ms, kriStatus: out.status, html: out.html });
+    res.json({
+      ok: true,
+      tookMs: ms,
+      kriStatus: out.status,
+      cols: out.cols,
+      rows: out.rows,
+      xml: out.xml
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || "Unknown error" });
   }
 });
 
-// ✅ 기본정보 단일 호출
 app.post("/basic", auth, async (req, res) => {
   try {
     const { rschrRegNo, name } = req.body || {};
@@ -358,7 +441,6 @@ app.post("/basic", auth, async (req, res) => {
   }
 });
 
-// ✅ 경력사항 단일 호출
 app.post("/career", auth, async (req, res) => {
   try {
     const { rschrRegNo } = req.body || {};
@@ -373,7 +455,6 @@ app.post("/career", auth, async (req, res) => {
   }
 });
 
-// ✅ 수상사항 단일 호출
 app.post("/awards", auth, async (req, res) => {
   try {
     const { rschrRegNo } = req.body || {};
@@ -388,8 +469,6 @@ app.post("/awards", auth, async (req, res) => {
   }
 });
 
-app.listen(port, () => console.log(`kri-relay listening on ${port}`));
-// ✅ 논문실적 단일 호출
 app.post("/papers", auth, async (req, res) => {
   try {
     const { rschrRegNo } = req.body || {};
@@ -404,7 +483,6 @@ app.post("/papers", auth, async (req, res) => {
   }
 });
 
-// ✅ 연구비 단일 호출
 app.post("/funding", auth, async (req, res) => {
   try {
     const { rschrRegNo } = req.body || {};
@@ -419,4 +497,6 @@ app.post("/funding", auth, async (req, res) => {
   }
 });
 
+// -------------------- listen --------------------
 const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`kri-relay listening on ${port}`));
