@@ -198,7 +198,7 @@ function parseIbsheetTrRows(xmlText, cols) {
 }
 
 // -------------------- WWW search (replaces mobile search) --------------------
-async function kriSearchWww({ name, pageNo = 1, pageSize = 100, userId = KRI_UID, requestOrder }) {
+async function kriSearchWww({ name, pageNo = 1, pageSize = 500, userId = KRI_UID, requestOrder }) {
   const { cookieFetch } = makeClient();
   await kriLoginAndWarmup(cookieFetch);
 
