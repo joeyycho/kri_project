@@ -391,6 +391,35 @@ async function kriFunding({ rschrRegNo }) {
   return { status: resp.status, body: await resp.text() };
 }
 
+
+const kriDegree = async ({ rschrRegNo }) => {
+    const { cookieFetch } = makeClient();
+    await kriLoginAndWarmup(cookieFetch);  // 로그인 및 초기화
+
+    // 요청에 필요한 폼 데이터 준비
+    const form = new URLSearchParams();
+    form.set(
+      "requestOrder",
+      "|MNG_NO|DGR_STT_YM|ACQS_DGR_DVS_CD|DGR_ACQS_YM|DGR_ACQS_AGC_CD|DGR_ACQS_AGC_NM|DGR_ACQS_NTN_CD|DGR_ACQS_NTN_NM|DGR_ACQS_CLG_NM|DGR_ACQS_SBJT_NM|DGR_SPCL_CD|DGR_SPCL_NM|DGR_DTL_SPCL_NM|TUTOR_RSCHR_REG_NO|TUTOR_NM|LANG_DGR_PPR_NM|ORG_LANG_DGR_PPR_NM|DIFF_LANG_DGR_PPR_NM|DGR_PPR_XCPT_CNTN|LAST_DGR_SLCT_CD|REG_PE_ID|REG_DTTM|MOD_PE_ID|MOD_DTTM|DEL_DVS_CD|MDF_FOUN_DVS_CD|MDF_DVS_CD|MDF_RSLT_YN|REPL_DTTM|MDF_IP_NO|APD01_FLD_NM|APD02_FLD_NM|APD03_FLD_NM|APD04_FLD_NM|APD05_FLD_NM|LOGIC_FILE_NM|PHYSIC_FILE_NM||DATA_SRC_DVS_CD|BLNG_UNIV_CD|CHK"
+    );
+    form.set("sheetAcation", "F");
+    form.set("txtRschrRegNo", String(rschrRegNo));  // rschrRegNo 받아서 사용
+
+    // 서버에 POST 요청을 보냄
+    const resp = await cookieFetch("https://www.kri.go.kr/kri/rp/rschachv/PG-RP-103-01js.jsp", {
+      method: "POST",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+        "Content-Type": "application/x-www-form-urlencoded",
+        Origin: "https://www.kri.go.kr",
+        Referer: "https://www.kri.go.kr/kri/rp/rschachv/PG-RP-103-01js.jsp"
+      },
+      body: form.toString()
+    });
+return { status: resp.status, body: await resp.text() };
+
+  }
+
 // -------------------- routes --------------------
 app.get("/health", (req, res) => res.json({ ok: true }));
 
@@ -499,41 +528,15 @@ app.post("/funding", auth, async (req, res) => {
 
 // 기존 코드에 추가될 새로운 엔드포인트
 
-app.post("/acquired-degrees", auth, async (req, res) => {
+app.post("/degree", auth, async (req, res) => {
   try {
     const { rschrRegNo } = req.body || {};
     if (!rschrRegNo) {
       return res.status(400).json({ ok: false, error: "rschrRegNo is required" });
     }
-
-    // -------------------- HTTP 요청 (취득학위) --------------------
-    const { cookieFetch } = makeClient();
-    await kriLoginAndWarmup(cookieFetch);  // 로그인 및 초기화
-
-    // 요청에 필요한 폼 데이터 준비
-    const form = new URLSearchParams();
-    form.set(
-      "requestOrder",
-      "|MNG_NO|DGR_STT_YM|ACQS_DGR_DVS_CD|DGR_ACQS_YM|DGR_ACQS_AGC_CD|DGR_ACQS_AGC_NM|DGR_ACQS_NTN_CD|DGR_ACQS_NTN_NM|DGR_ACQS_CLG_NM|DGR_ACQS_SBJT_NM|DGR_SPCL_CD|DGR_SPCL_NM|DGR_DTL_SPCL_NM|TUTOR_RSCHR_REG_NO|TUTOR_NM|LANG_DGR_PPR_NM|ORG_LANG_DGR_PPR_NM|DIFF_LANG_DGR_PPR_NM|DGR_PPR_XCPT_CNTN|LAST_DGR_SLCT_CD|REG_PE_ID|REG_DTTM|MOD_PE_ID|MOD_DTTM|DEL_DVS_CD|MDF_FOUN_DVS_CD|MDF_DVS_CD|MDF_RSLT_YN|REPL_DTTM|MDF_IP_NO|APD01_FLD_NM|APD02_FLD_NM|APD03_FLD_NM|APD04_FLD_NM|APD05_FLD_NM|LOGIC_FILE_NM|PHYSIC_FILE_NM||DATA_SRC_DVS_CD|BLNG_UNIV_CD|CHK"
-    );
-    form.set("sheetAcation", "F");
-    form.set("txtRschrRegNo", String(rschrRegNo));  // rschrRegNo 받아서 사용
-
-    // 서버에 POST 요청을 보냄
-    const resp = await cookieFetch("https://www.kri.go.kr/kri/rp/rschachv/PG-RP-103-01js.jsp", {
-      method: "POST",
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-        "Content-Type": "application/x-www-form-urlencoded",
-        Origin: "https://www.kri.go.kr",
-        Referer: "https://www.kri.go.kr/kri/rp/rschachv/PG-RP-103-01js.jsp"
-      },
-      body: form.toString()
-    });
-
-    // 응답 받아서 처리
-    const body = await resp.text();
-    res.json({ ok: true, tookMs: Date.now() - t0, body });
+    const t0 = Date.now();
+    const out = await kriDegree({ rschrRegNo });
+    res.json({ ok: true, tookMs: Date.now() - t0, ...out });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || "Unknown error" });
   }
